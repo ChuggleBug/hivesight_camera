@@ -5,6 +5,8 @@
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
 #include <HTTPClient.h>
+#include <vector>
+#include <algorithm>
 
 #include "time.h"
 
@@ -29,9 +31,15 @@ HTTPClient http;
 
 bool wifi_man_complete = false;
 
+// Topics to subscribe to
+const char *sensor_topic_prefix = "sensor/";
+String sensor_topic = sensor_topic_prefix + String("+");
+String mapping_topic; // = "mapping/" + deviceName
+std::vector<String> mapped_sensors;
 
 // Functions
 void coordinator_register_device();
+void mqtt_broker_sub_cb(char* topic, uint8_t* payload, unsigned int len);
 
 // Interrupts
 void IRAM_ATTR mqtt_svc_signal_event();
@@ -54,7 +62,18 @@ void setup() {
   mqttClient.connect(deviceName.c_str());
   Serial.println("Connected to broker!");
 
-  timeClient.begin();
+  // Topics to listen to
+  mapping_topic = "mapping/" + deviceName;
+  Serial.printf("Subscribing to topic %s...", sensor_topic.c_str());
+  Serial.println();
+  Serial.printf("Subscribing to topic %s...", mapping_topic.c_str());
+  Serial.println();
+
+  if (!mqttClient.subscribe(sensor_topic.c_str()) || !mqttClient.subscribe(mapping_topic.c_str())){
+    Serial.println("Failed to set subscribe");
+    vTaskSuspend( NULL );
+  }
+  mqttClient.setCallback(mqtt_broker_sub_cb);
 
   coordinator_register_device();
 }
@@ -68,7 +87,7 @@ void loop() {
     Serial.println("Reconnected to broker!");
   }
 
-  delay(5000);
+  delay(10);
 }
 
 void mqtt_notif_loop(void* args) {
@@ -116,4 +135,48 @@ void coordinator_register_device() {
 
   Serial.printf("HTTP Response: %d", resp_code);
   Serial.println();
+}
+
+
+void mqtt_broker_sub_cb(char* topic, uint8_t* payload, unsigned int len) {
+  // Handle known topics
+  Serial.printf("Got topic \"%s\"!", topic);
+  Serial.println();
+
+  // Expect data such as { "camName": ["sensor1", "sensor2", ...] }
+  if (strcmp(topic, mapping_topic.c_str()) == 0) {
+    ArduinoJson::JsonDocument json;
+    deserializeJson(json, (char*)payload, len);
+    ArduinoJson::JsonArray sensors = json[deviceName];
+    Serial.printf("Registering new devices: ");
+    for (JsonVariant v : sensors) {
+      String sensor = v.as<String>();
+      Serial.printf("%s, ", sensor.c_str());
+      mapped_sensors.push_back(v.as<String>());
+    }
+    Serial.printf("\b\b ");
+    Serial.println();
+  }
+  // Matches "sensor/"
+  else if (strncmp(topic, sensor_topic_prefix, strlen(sensor_topic_prefix)) == 0) {
+     // topic starts with "sensor/"
+    String sensorName = String(topic + strlen(sensor_topic_prefix)); // get the part after "sensor/"
+
+    if (std::none_of(mapped_sensors.begin(), mapped_sensors.end(), 
+      [=](const String& s) {
+        return s == sensorName;
+    })) { 
+      // Not a sensor to respond to
+      return; 
+    }
+
+    Serial.printf("%s is a mapped sensor!", sensorName.c_str());
+    Serial.println();
+
+  }
+  else {
+    Serial.printf("Uknown topic: %s", topic);
+    Serial.println();
+  }
+
 }
