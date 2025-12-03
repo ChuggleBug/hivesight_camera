@@ -12,14 +12,18 @@
  * to on device SD card
  * 
  */
-#define CONFIG_CAMERA_SAVE_FRAME_RATE (30)
+#define CONFIG_CAMERA_FRAME_RATE (30)
 
 /**
- * @brief Maximum allowable framerate for sending video
- * over to coordinator over HTTP
+ * @brief Scalar value to transmit framebuffers over HTTP
+ * Since sending a frame over HTTP is considerably slower
+ * than saving it, only some frames should be sent over
+ * @note behavior is undefined for scalar values < 1
+ * @note It is recomended to set this to a multiple of
+ * the frame rate
  * 
  */
-#define CONFIG_CAMERA_STREAM_FRAME_RATE (5)
+#define CONFIG_CAMERA_STREAM_FRAME_DOWNSCALE ((int) 15)
 
 /**
  * @brief Root of camera frame buffers

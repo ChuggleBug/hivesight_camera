@@ -18,25 +18,40 @@
 #include "main.h"
 
 // === Local Defines ===
-#define CAMERA_FB_SAVE_SZ (CONFIG_CAMERA_SAVE_FRAME_RATE * 2)
+#define CAMERA_FB_SAVE_SZ (CONFIG_CAMERA_FRAME_RATE * 2)
 
 void camera_svc_start();
 
 void camera_svc_task(void *pvParameters);
 void camera_svc_save_task(void *pvParameters);
+void camera_svc_http_task(void *pvParameters);
 
+static void _ensure_empty_dir(const char *path);
 static void save_fb_to_sd(const camera_fb_t *fb, int time_index,
                           int frame_index);
 
 TaskHandle_t CameraServiceTask;
 TaskHandle_t CameraServiceSaveTask;
+TaskHandle_t CameraServiceHTTPTask;
 
-QueueHandle_t CameraFBSaveQ;
+/**
+ * @brief Camera Service -> Camera Save Service Queue
+ * @note The save task frees the camera buffer (if it
+ * decides not to send it to the HTTP task)
+ */
+QueueHandle_t CameraFBSaveQ;  // <camera_frame_t>
+/**
+ * @brief Camera Save Service -> Camera HTTP Service
+ * @note The frame buffer is always released at this point
+ * whether or not the transmission succeeds
+ *
+ */
+QueueHandle_t CameraFBHTTPQ;  // <camera_frame_t>
 
 typedef struct _app_camera_frame {
   camera_fb_t *fb;
-  unsigned long time_index;
-  unsigned long frame_index;
+  int time_index;
+  int frame_index;
 } camera_frame_t;
 
 void camera_svc_start() {
@@ -49,6 +64,8 @@ void camera_svc_start() {
   SD_MMC.mkdir(CAMERA_FB_ROOT);
 
   xQueueCreate(CAMERA_FB_SAVE_SZ, sizeof(camera_frame_t));
+  xQueueCreate(CAMERA_FB_SAVE_SZ / CONFIG_CAMERA_STREAM_FRAME_DOWNSCALE,
+               sizeof(camera_frame_t));
 
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
@@ -135,26 +152,18 @@ void camera_svc_start() {
 
   xTaskCreate(camera_svc_save_task, "CamSvcSaveTask", 8192, NULL, 2,
               &CameraServiceSaveTask);
+
+  xTaskCreate(camera_svc_http_task, "CamSvcSaveTask", 8192, NULL, 8,
+              &CameraServiceSaveTask);
 }
 
 void camera_svc_task(void *pvParameters) {
   camera_fb_t *fb = NULL;
-  static char url_buf[256];
-  String url;
-  String path;
   int prev_time_index;
   int time_index;
   int frame_index = 0;
-  int resp;
   camera_frame_t frame;
-  
-  // Create url to use for API call
-  memset(url_buf, 0, 256);
-  snprintf(url_buf, 256, "http://%s:%d/api/device/stream?device=%s",
-           coordinatorIP.toString().c_str(), coordinatorPort,
-           deviceName.c_str());
-  // Arduino libaries like to use String instead of char*
-  url = url_buf;
+
   TickType_t prevTick = xTaskGetTickCount();
   prev_time_index = timeClient.getEpochTime() % (CAMERA_FB_SECOND_RANGE * 2);
   for (;;) {
@@ -179,54 +188,89 @@ void camera_svc_task(void *pvParameters) {
     // Fail immediately if the save queue is full
     // in order to try and maintain framerate
     if (xQueueSend(CameraFBSaveQ, &frame, 0) != pdPASS) {
-      Serial.println("Frame dropped...");
+      Serial.println("Frame dropped when passing it to save routine...");
       esp_camera_fb_return(fb);
     }
 
-    // unsigned long t_start = millis();
-
-    // http.begin(url);
-    // http.addHeader("Content-Type", "image/jpeg");
-    // resp = http.PUT(fb->buf, fb->len);
-
-    // unsigned long t_end = millis();
-    // unsigned long elapsed = t_end - t_start;
-
-    // Serial.printf("Upload time: %lu ms\n", elapsed);
-
-    // if (resp != HTTP_CODE_NO_CONTENT) {
-    //   String err_msg = http.errorToString(resp);
-    //   Serial.printf("Unexpected response. Got %s (%d)\n", err_msg.c_str(),
-    //                 resp);
-    // }
-
-    // http.end();
-
-    vTaskDelayUntil(&prevTick, pdMS_TO_TICKS(1000 / CONFIG_CAMERA_SAVE_FRAME_RATE))
+    vTaskDelayUntil(&prevTick, pdMS_TO_TICKS(1000 / CONFIG_CAMERA_FRAME_RATE))
   }
 }
 
 void camera_svc_save_task(void *pvParameters) {
   camera_frame_t frame;
+  int frame_count = 0;
 
   for (;;) {
     xQueueReceive(CameraFBSaveQ, &frame, portMAX_DELAY);
 
     save_fb_to_sd(frame.fb, frame.time_index, frame.frame_index);
+    frame_count++;
 
     // Because sending an image over HTTP is considerably slower,
     // only some frames will be sent over. In that case, the frame
     // to be sent will not be released (yet)
-    // TODO: Pass frame over to http transmitter task
-
-    esp_camera_fb_return(frame.fb);
+    if (frame_count >=
+        (CONFIG_CAMERA_FRAME_RATE / CONFIG_CAMERA_STREAM_FRAME_DOWNSCALE)) {
+      frame_count = 0;
+      if (xQueueSend(CameraFBHTTPQ, &frame, 0) != pdPASS) {
+        Serial.println("Frame dropped when passing it to http routine...");
+        esp_camera_fb_return(frame.fb);
+      }
+    } else {
+      esp_camera_fb_return(frame.fb);
+    }
 
     // Is anything else busy?
     portYIELD();
   }
 }
 
-static void ensure_empty_dir(const char *path) {
+void camera_svc_http_task(void *pvParameters) {
+  static char url_buf[256];
+  camera_frame_t frame;
+  String url;
+  String path;
+  int resp;
+
+  // Create url to use for API call
+  memset(url_buf, 0, 256);
+  snprintf(url_buf, 256, "http://%s:%d/api/device/stream?device=%s",
+           coordinatorIP.toString().c_str(), coordinatorPort,
+           deviceName.c_str());
+  // Arduino libaries like to use String instead of char*
+  url = url_buf;
+
+  for (;;) {
+    // Mostly to reuse old code
+    camera_fb_t *fb;
+    xQueueReceive(CameraFBHTTPQ, &frame, portMAX_DELAY);
+    fb = frame.fb;
+
+    // Analytics
+    unsigned long t_start = millis();
+
+    http.begin(url);
+    http.addHeader("Content-Type", "image/jpeg");
+    resp = http.PUT(fb->buf, fb->len);
+
+    unsigned long t_end = millis();
+    unsigned long elapsed = t_end - t_start;
+
+    Serial.printf("Upload time: %lu ms\n", elapsed);
+
+    if (resp != HTTP_CODE_NO_CONTENT) {
+      String err_msg = http.errorToString(resp);
+      Serial.printf("Unexpected response. Got %s (%d)\n", err_msg.c_str(),
+                    resp);
+    }
+
+    http.end();
+
+    esp_camera_fb_return(fb);
+  }
+}
+
+static void _ensure_empty_dir(const char *path) {
   if (!SD_MMC.exists(path)) {
     SD_MMC.mkdir(path);
     return;
@@ -264,7 +308,7 @@ static void save_fb_to_sd(const camera_fb_t *fb, int time_index,
   // Create or reset directory
   static int last_time_index = -1;
   if (time_index != last_time_index) {
-    ensure_empty_dir(dir_path);
+    _ensure_empty_dir(dir_path);
     last_time_index = time_index;
   }
 
