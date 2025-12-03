@@ -1,66 +1,112 @@
-#include <Arduino.h>
-#include <WiFi.h>
-#include <WiFiUdp.h>
-#include <NTPClient.h>
-#include <PubSubClient.h>
-#include <ArduinoJson.h>
-#include <HTTPClient.h>
-#include <vector>
-#include <algorithm>
+#include "main.h"
 
+#include <Arduino.h>
+#include <ArduinoJson.h>
+
+#include <algorithm>
+#include <vector>
+
+#include "esp_attr.h"
+#include "freertos/FreeRTOS.h"
 #include "time.h"
 
-#include "freertos/FreeRTOS.h"
-#include "esp_attr.h"
-
-#include "main.h"
-#include "wifi_man.h"
-
-// main.h extern defined variables
-const uint16_t brokerPort = BROKER_PORT;
-const uint16_t httpPort = COORDINATOR_HTTP_PORT;
-Preferences prefs;
-
-// Application specific objects
-// (exclusive to this file)
+// Network interfaces
 WiFiClient netif;
 WiFiUDP netifUDP;
 PubSubClient mqttClient(netif);
 NTPClient timeClient(netifUDP);
 HTTPClient http;
 
-bool wifi_man_complete = false;
-
 // Topics to subscribe to
-const char *sensor_topic_prefix = "sensor/";
+const char* sensor_topic_prefix = "sensor/";
 String sensor_topic = sensor_topic_prefix + String("+");
-String mapping_topic; // = "mapping/" + deviceName
+String mapping_topic;  // = "mapping/" + deviceName
 std::vector<String> mapped_sensors;
 
 // Functions
 void coordinator_register_device();
 void mqtt_broker_sub_cb(char* topic, uint8_t* payload, unsigned int len);
 
-// Interrupts
+// === Macros ===
+
+#define panic(fmt, ...)                \
+  do {                                 \
+    Serial.printf(fmt, ##__VA_ARGS__); \
+    Serial.println();                  \
+    vTaskSuspend(NULL);                \
+  } while (0)
+
+// === Static / Local Variables ===
+
+// === Function Declarations ===
+
+void coordinator_register_device();
+extern bool load_device_configs(fs::FS& fs);
+extern void camera_svc_start();
+
+static void format_fs(fs::FS& fs);
+static void delete_dir_recursive(fs::FS &fs, const char* path, fs::File dir);
+
 void IRAM_ATTR mqtt_svc_signal_event();
-void IRAM_ATTR reset_wifi_man_configs();
+void mqtt_notif_loop(void* args);
+
+// === Code Begin ===
 
 void setup() {
-  Serial.begin(BAUD_RATE);
-  prefs.begin("app");
+  Serial.begin(CONFIG_BAUD_RATE);
 
-  // Enable wifi manager reset pin
-  pinMode(CONFIG_WIFI_RST_PIN_NO, INPUT_PULLDOWN);
-  attachInterrupt(digitalPinToInterrupt(CONFIG_WIFI_RST_PIN_NO),
-                  reset_wifi_man_configs, RISING);
+  if (!LittleFS.begin()) {
+    panic("Failed to init Flash FS");
+  }
 
-  wifi_man_svc_start();
-  wifi_man_complete = true;
+  if (!SD_MMC.begin()) {
+    panic("Failed to init SD FS");
+  }
+
+  if (!load_device_configs(LittleFS)) {
+    panic("Failed to load configurations");
+  }
+
+  Serial.println();
+  Serial.println("Configurations");
+  Serial.print("Wifi SSID:        ");
+  Serial.println(wifiSSID);
+  Serial.print("Wifi password:    ");
+  for (char c : wifiPass) {
+    Serial.print('*');
+  }
+  Serial.println();
+  Serial.print("Device Name:      ");
+  Serial.println(deviceName);
+  Serial.print("Broker IP:        ");
+  Serial.println(brokerIP);
+  Serial.print("Broker Port:      ");
+  Serial.println(brokerPort);
+  Serial.print("Coordinator IP:   ");
+  Serial.println(coordinatorIP);
+  Serial.print("Coordinator Port: ");
+  Serial.println(coordinatorPort);
+  Serial.println();
+
+  Serial.print("Connecting to network over Wi-Fi");
+  WiFi.begin(wifiSSID, wifiPass);
+  while (!WiFi.isConnected()) {
+    Serial.print('.');
+    delay(1000);
+  }
+  Serial.println();
+
+  Serial.println("Connected!");
+
+  // Clear from memory
+  wifiPass.clear();
 
   Serial.println("Configuring mqtt...");
-  mqttClient.setServer(coordinatorIP, brokerPort);
+  mqttClient.setServer(brokerIP, brokerPort);
   mqttClient.connect(deviceName.c_str());
   Serial.println("Connected to broker!");
+
+  timeClient.begin();
 
   // Topics to listen to
   mapping_topic = "mapping/" + deviceName;
@@ -69,74 +115,55 @@ void setup() {
   Serial.printf("Subscribing to topic %s...", mapping_topic.c_str());
   Serial.println();
 
-  if (!mqttClient.subscribe(sensor_topic.c_str()) || !mqttClient.subscribe(mapping_topic.c_str())){
+  if (!mqttClient.subscribe(sensor_topic.c_str()) ||
+      !mqttClient.subscribe(mapping_topic.c_str())) {
     Serial.println("Failed to set subscribe");
-    vTaskSuspend( NULL );
+    vTaskSuspend(NULL);
   }
   mqttClient.setCallback(mqtt_broker_sub_cb);
 
   coordinator_register_device();
+
+  camera_svc_start();
 }
 
 void loop() {
-  mqttClient.loop(); 
+  mqttClient.loop();
   timeClient.update();
 
   if (!mqttClient.connected()) {
-    mqttClient.connect(deviceName.c_str());
-    Serial.println("Reconnected to broker!");
+    Serial.println("Lost connection to broker");
+    if (mqttClient.connect(deviceName.c_str())) {
+      Serial.println("Reconnected to broker!");
+    } else {
+      Serial.println("Failed to reconnect...");
+    }
   }
 
   delay(10);
 }
 
-void mqtt_notif_loop(void* args) {
-  String topic = "sensor/" + deviceName;
-  ArduinoJson::JsonDocument json;
-  static char buf[512];
-  memset(buf, 0, 512);
-  while (1) {
-    // This task will block until something else notifies it
-    ulTaskNotifyTake( pdTRUE, portMAX_DELAY );
-
-    // Report the time of event and send a json
-    json["time"] = timeClient.getEpochTime();
-    serializeJson(json, buf);
-
-    Serial.println("Sending topic " + topic);
-    mqttClient.publish(topic.c_str(), buf);
-  }
-}
-
-void IRAM_ATTR reset_wifi_man_configs() {
-  Serial.println("Resetting preferences and core...");
-  Serial.flush();
-  if (wifi_man_complete) {
-    wifi_man_reset();
-  }
-  ESP.restart();
-}
-
 void coordinator_register_device() {
   ArduinoJson::JsonDocument json;
-  int resp_code;
+  int resp_code = 0;
   static char buf[256];
   memset(buf, 0, 256);
 
   json["name"] = deviceName;
-  json["type"] = "camera";
+  json["type"] = DEVICE_TYPE;
 
-  Serial.println(coordinatorIP.toString());
-  Serial.println(httpPort);
-  http.begin(coordinatorIP.toString(), httpPort, "/api/device/register");
-  http.addHeader("Content-Type", "application/json");
-  serializeJson(json, buf);
-  resp_code = http.PUT(buf);
+  Serial.println("Registering devivce...");
+  while (resp_code != HTTP_CODE_NO_CONTENT) {
+    http.begin(coordinatorIP.toString(), coordinatorPort,
+               "/api/device/register");
+    http.addHeader("Content-Type", "application/json");
+    serializeJson(json, buf);
+    resp_code = http.PUT(buf);
 
-  Serial.printf("HTTP Response: %d", resp_code);
-  Serial.println();
+    Serial.printf("HTTP Response: %d", resp_code);
+    Serial.println();
+  }
 }
-
 
 void mqtt_broker_sub_cb(char* topic, uint8_t* payload, unsigned int len) {
   // Handle known topics
@@ -158,25 +185,50 @@ void mqtt_broker_sub_cb(char* topic, uint8_t* payload, unsigned int len) {
     Serial.println();
   }
   // Matches "sensor/"
-  else if (strncmp(topic, sensor_topic_prefix, strlen(sensor_topic_prefix)) == 0) {
-     // topic starts with "sensor/"
-    String sensorName = String(topic + strlen(sensor_topic_prefix)); // get the part after "sensor/"
+  else if (strncmp(topic, sensor_topic_prefix, strlen(sensor_topic_prefix)) ==
+           0) {
+    // topic starts with "sensor/"
+    String sensorName = String(
+        topic + strlen(sensor_topic_prefix));  // get the part after "sensor/"
 
-    if (std::none_of(mapped_sensors.begin(), mapped_sensors.end(), 
-      [=](const String& s) {
-        return s == sensorName;
-    })) { 
+    if (std::none_of(mapped_sensors.begin(), mapped_sensors.end(),
+                     [=](const String& s) { return s == sensorName; })) {
       // Not a sensor to respond to
-      return; 
+      return;
     }
 
     Serial.printf("%s is a mapped sensor!", sensorName.c_str());
     Serial.println();
 
-  }
-  else {
+  } else {
     Serial.printf("Uknown topic: %s", topic);
     Serial.println();
   }
+}
 
+static void format_fs(fs::FS& fs) {
+  delete_dir_recursive(fs, "/", fs.open("/"));
+}
+
+static void delete_dir_recursive(fs::FS &fs, const char* path, fs::File dir) {
+  while (true) {
+    File entry = dir.openNextFile();
+    if (!entry) {
+      // No more files
+      break;
+    }
+
+    if (entry.isDirectory()) {
+      Serial.print("Deleting directory: ");
+      Serial.println(entry.name());
+      delete_dir_recursive(fs, entry.name(), entry);  // Recurse into subdirectories
+      fs.rmdir(entry.name());                     // Delete the empty directory
+    } else {
+      Serial.print("Deleting file: ");
+      Serial.println(entry.name());
+      fs.remove(entry.name());  // Delete the file
+    }
+    entry.close();
+  }
+  dir.close();
 }

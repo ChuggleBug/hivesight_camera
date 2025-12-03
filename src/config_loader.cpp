@@ -21,13 +21,13 @@ uint16_t coordinatorPort;
 
 // === Function Declarations ===
 
-bool load_device_configs(const fs::FS &fs);
+bool load_device_configs(fs::FS &fs);
 
-bool load_device_configs(const fs::FS &fs) {
+bool load_device_configs(fs::FS &fs) {
   ArduinoJson::JsonDocument json;
   static char buf[JSON_MAX_SIZE];
 
-  fs::File file = LittleFS.open("/config.json");
+  fs::File file = fs.open("/config.json");
   if (!file) {
     return false;
   }
