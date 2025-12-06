@@ -44,8 +44,8 @@ void coordinator_register_device();
 extern bool load_device_configs(fs::FS& fs);
 extern void camera_svc_start();
 
-static void format_fs(fs::FS& fs);
-static void delete_dir_recursive(fs::FS &fs, const char* path, fs::File dir);
+static void delete_dir_recursive(fs::FS &fs, const char* path);
+static void _delete_dir_r(fs::FS &fs, const char* path, fs::File dir);
 
 void IRAM_ATTR mqtt_svc_signal_event();
 void mqtt_notif_loop(void* args);
@@ -62,10 +62,11 @@ void setup() {
   if (!SD_MMC.begin()) {
     panic("Failed to init SD FS");
   }
-
+  
   if (!load_device_configs(LittleFS)) {
     panic("Failed to load configurations");
   }
+
 
   Serial.println();
   Serial.println("Configurations");
@@ -206,11 +207,12 @@ void mqtt_broker_sub_cb(char* topic, uint8_t* payload, unsigned int len) {
   }
 }
 
-static void format_fs(fs::FS& fs) {
-  delete_dir_recursive(fs, "/", fs.open("/"));
+static void delete_dir_recursive(fs::FS &fs, const char* path) {
+  fs::File dir = fs.open(path);
+  _delete_dir_r(fs, path, dir);
 }
 
-static void delete_dir_recursive(fs::FS &fs, const char* path, fs::File dir) {
+static void _delete_dir_r(fs::FS &fs, const char* path, fs::File dir) {
   while (true) {
     File entry = dir.openNextFile();
     if (!entry) {
@@ -221,7 +223,7 @@ static void delete_dir_recursive(fs::FS &fs, const char* path, fs::File dir) {
     if (entry.isDirectory()) {
       Serial.print("Deleting directory: ");
       Serial.println(entry.name());
-      delete_dir_recursive(fs, entry.name(), entry);  // Recurse into subdirectories
+      _delete_dir_r(fs, entry.name(), entry);  // Recurse into subdirectories
       fs.rmdir(entry.name());                     // Delete the empty directory
     } else {
       Serial.print("Deleting file: ");

@@ -12,7 +12,7 @@
  * to on device SD card
  * 
  */
-#define CONFIG_CAMERA_FRAME_RATE (30)
+#define CONFIG_CAMERA_FRAME_RATE (6)
 
 /**
  * @brief Scalar value to transmit framebuffers over HTTP
@@ -23,7 +23,10 @@
  * the frame rate
  * 
  */
-#define CONFIG_CAMERA_STREAM_FRAME_DOWNSCALE ((int) 15)
+#define CONFIG_CAMERA_STREAM_FRAME_DOWNSCALE (2)
+
+
+#define CONFIG_HTTP_UPLOAD_TIMEOUT_MS (500)
 
 /**
  * @brief Root of camera frame buffers

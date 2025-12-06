@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <WiFi.h>
 
+#include "app_config.h"
 #include "board_config.h"
 #include "esp32-hal-ledc.h"
 #include "esp_camera.h"
@@ -8,51 +9,89 @@
 #include "esp_timer.h"
 #include "fb_gfx.h"
 #include "img_converters.h"
-#include "sdkconfig.h"
-
-// ===========================
-// Select camera model in board_config.h
-// ===========================
-#include "app_config.h"
-#include "board_config.h"
 #include "main.h"
+#include "sdkconfig.h"
 
 // === Local Defines ===
 #define CAMERA_FB_SAVE_SZ (CONFIG_CAMERA_FRAME_RATE * 2)
 
+// === Local Functions ===
+
 void camera_svc_start();
+static void _ensure_empty_dir(const char *path);
+static void save_fb_to_sd(const camera_fb_t *fb, int time_index,
+                          int frame_index);
+
+// === Task Functions ===
 
 void camera_svc_task(void *pvParameters);
 void camera_svc_save_task(void *pvParameters);
 void camera_svc_http_task(void *pvParameters);
 
-static void _ensure_empty_dir(const char *path);
-static void save_fb_to_sd(const camera_fb_t *fb, int time_index,
-                          int frame_index);
+// === FreeRTOS Objects ===
 
 TaskHandle_t CameraServiceTask;
 TaskHandle_t CameraServiceSaveTask;
 TaskHandle_t CameraServiceHTTPTask;
 
-/**
- * @brief Camera Service -> Camera Save Service Queue
- * @note The save task frees the camera buffer (if it
- * decides not to send it to the HTTP task)
- */
-QueueHandle_t CameraFBSaveQ;  // <camera_frame_t>
-/**
- * @brief Camera Save Service -> Camera HTTP Service
- * @note The frame buffer is always released at this point
- * whether or not the transmission succeeds
- *
- */
-QueueHandle_t CameraFBHTTPQ;  // <camera_frame_t>
+QueueHandle_t CameraFBSaveQ;  // <camera_frame_t*>
+QueueHandle_t CameraFBHTTPQ;  // <camera_frame_t*>
 
+// Reference-counted frame wrapper
 typedef struct _app_camera_frame {
   camera_fb_t *fb;
   int time_index;
   int frame_index;
+  int refs;
 } camera_frame_t;
+
+/**
+ * @note The refs counter to ensure free only once
+ * was generated using AI. The logic of passing
+ * framebuffers to svc -> save -> http was human design
+ * 
+ */
+
+static portMUX_TYPE frame_mux = portMUX_INITIALIZER_UNLOCKED;
+
+static camera_frame_t *frame_alloc(camera_fb_t *fb, int time_index,
+                                   int frame_index) {
+  camera_frame_t *f = (camera_frame_t *)pvPortMalloc(sizeof(camera_frame_t));
+  if (!f) return NULL;
+  f->fb = fb;
+  f->time_index = time_index;
+  f->frame_index = frame_index;
+  f->refs = 1;
+  return f;
+}
+
+// increment reference count (thread-safe)
+static void frame_ref(camera_frame_t *f) {
+  if (!f) return;
+  portENTER_CRITICAL(&frame_mux);
+  f->refs++;
+  portEXIT_CRITICAL(&frame_mux);
+}
+
+// decrement reference count and free when 0 (returns fb exactly once)
+static void frame_release(camera_frame_t *f) {
+  if (!f) return;
+  bool do_free = false;
+  portENTER_CRITICAL(&frame_mux);
+  f->refs--;
+  if (f->refs <= 0) {
+    do_free = true;
+  }
+  portEXIT_CRITICAL(&frame_mux);
+
+  if (do_free) {
+    if (f->fb) {
+      // return framebuffer to driver
+      esp_camera_fb_return(f->fb);
+    }
+    vPortFree(f);
+  }
+}
 
 void camera_svc_start() {
   Serial.println("Starting Camera...");
@@ -63,9 +102,11 @@ void camera_svc_start() {
   }
   SD_MMC.mkdir(CAMERA_FB_ROOT);
 
-  xQueueCreate(CAMERA_FB_SAVE_SZ, sizeof(camera_frame_t));
-  xQueueCreate(CAMERA_FB_SAVE_SZ / CONFIG_CAMERA_STREAM_FRAME_DOWNSCALE,
-               sizeof(camera_frame_t));
+  // Queues hold pointers to camera_frame_t
+  CameraFBSaveQ = xQueueCreate(CAMERA_FB_SAVE_SZ, sizeof(camera_frame_t *));
+  CameraFBHTTPQ =
+      xQueueCreate(CAMERA_FB_SAVE_SZ / CONFIG_CAMERA_STREAM_FRAME_DOWNSCALE,
+                   sizeof(camera_frame_t *));
 
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
@@ -87,7 +128,8 @@ void camera_svc_start() {
   config.pin_pwdn = PWDN_GPIO_NUM;
   config.pin_reset = RESET_GPIO_NUM;
   config.xclk_freq_hz = 20000000;
-  config.frame_size = FRAMESIZE_QVGA;
+  // config.frame_size = FRAMESIZE_QVGA;
+  config.frame_size = FRAMESIZE_UXGA;
   config.pixel_format = PIXFORMAT_JPEG;  // for streaming
   // config.pixel_format = PIXFORMAT_RGB565; // for face detection/recognition
   config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
@@ -123,16 +165,16 @@ void camera_svc_start() {
   // camera init
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) {
-    Serial.printf("Camera init failed with error 0x%x", err);
+    Serial.printf("Camera init failed with error 0x%x\n", err);
     return;
   }
 
   sensor_t *s = esp_camera_sensor_get();
   // initial sensors are flipped vertically and colors are a bit saturated
   if (s->id.PID == OV3660_PID) {
-    s->set_vflip(s, 1);        // flip it back
-    s->set_brightness(s, 1);   // up the brightness just a bit
-    s->set_saturation(s, -2);  // lower the saturation
+    s->set_vflip(s, 1);
+    s->set_brightness(s, 1);
+    s->set_saturation(s, -2);
   }
   // drop down frame size for higher initial frame rate
   if (config.pixel_format == PIXFORMAT_JPEG) {
@@ -150,11 +192,11 @@ void camera_svc_start() {
 
   xTaskCreate(camera_svc_task, "CamSvcTask", 8192, NULL, 5, &CameraServiceTask);
 
-  xTaskCreate(camera_svc_save_task, "CamSvcSaveTask", 8192, NULL, 2,
+  xTaskCreate(camera_svc_save_task, "CamSvcSaveTask", 8192, NULL, 6,
               &CameraServiceSaveTask);
 
-  xTaskCreate(camera_svc_http_task, "CamSvcSaveTask", 8192, NULL, 8,
-              &CameraServiceSaveTask);
+  xTaskCreate(camera_svc_http_task, "CamSvcHTTPTask", 16384, NULL, 7,
+              &CameraServiceHTTPTask);
 }
 
 void camera_svc_task(void *pvParameters) {
@@ -162,15 +204,14 @@ void camera_svc_task(void *pvParameters) {
   int prev_time_index;
   int time_index;
   int frame_index = 0;
-  camera_frame_t frame;
+
+  camera_frame_t *frame_ptr = NULL;
 
   TickType_t prevTick = xTaskGetTickCount();
   prev_time_index = timeClient.getEpochTime() % (CAMERA_FB_SECOND_RANGE * 2);
   for (;;) {
     time_index = timeClient.getEpochTime() % (CAMERA_FB_SECOND_RANGE * 2);
     if (prev_time_index != time_index) {
-      Serial.printf("Current time index = %d", time_index);
-      Serial.println();
       prev_time_index = time_index;
       frame_index = 0;
     }
@@ -178,95 +219,91 @@ void camera_svc_task(void *pvParameters) {
     fb = esp_camera_fb_get();
     if (fb == NULL) {
       Serial.println("Error capturing video buffer!");
-      continue;
+    } else {
+      frame_ptr = frame_alloc(fb, time_index, frame_index++);
+      if (!frame_ptr) {
+        Serial.println("Failed to allocate frame wrapper; returning fb");
+        esp_camera_fb_return(fb);
+      } else {
+        if (xQueueSend(CameraFBSaveQ, &frame_ptr, 0) != pdPASS) {
+          Serial.println("Frame dropped when passing it to save routine...");
+          frame_release(frame_ptr);
+        }
+      }
     }
 
-    frame.fb = fb;
-    frame.time_index = time_index;
-    frame.frame_index = frame_index;
-
-    // Fail immediately if the save queue is full
-    // in order to try and maintain framerate
-    if (xQueueSend(CameraFBSaveQ, &frame, 0) != pdPASS) {
-      Serial.println("Frame dropped when passing it to save routine...");
-      esp_camera_fb_return(fb);
-    }
-
-    vTaskDelayUntil(&prevTick, pdMS_TO_TICKS(1000 / CONFIG_CAMERA_FRAME_RATE))
+    vTaskDelayUntil(&prevTick, pdMS_TO_TICKS(1000 / CONFIG_CAMERA_FRAME_RATE));
   }
 }
 
 void camera_svc_save_task(void *pvParameters) {
-  camera_frame_t frame;
+  camera_frame_t *frame_ptr = NULL;
   int frame_count = 0;
 
   for (;;) {
-    xQueueReceive(CameraFBSaveQ, &frame, portMAX_DELAY);
+    if (xQueueReceive(CameraFBSaveQ, &frame_ptr, portMAX_DELAY) == pdPASS) {
+      if (!frame_ptr) continue;
 
-    save_fb_to_sd(frame.fb, frame.time_index, frame.frame_index);
-    frame_count++;
+      save_fb_to_sd(frame_ptr->fb, frame_ptr->time_index,
+                    frame_ptr->frame_index);
+      frame_count++;
 
-    // Because sending an image over HTTP is considerably slower,
-    // only some frames will be sent over. In that case, the frame
-    // to be sent will not be released (yet)
-    if (frame_count >=
-        (CONFIG_CAMERA_FRAME_RATE / CONFIG_CAMERA_STREAM_FRAME_DOWNSCALE)) {
-      frame_count = 0;
-      if (xQueueSend(CameraFBHTTPQ, &frame, 0) != pdPASS) {
-        Serial.println("Frame dropped when passing it to http routine...");
-        esp_camera_fb_return(frame.fb);
+      // Only send some frames to HTTP Task (since it is slower)
+      if (frame_count >=
+          (CONFIG_CAMERA_FRAME_RATE / CONFIG_CAMERA_STREAM_FRAME_DOWNSCALE)) {
+        frame_count = 0;
+        frame_ref(frame_ptr);
+        if (xQueueSend(CameraFBHTTPQ, &frame_ptr, 0) != pdPASS) {
+          Serial.println(
+              "Frame dropped when passing it to http routine... undoing ref");
+          frame_release(frame_ptr);
+        }
+        frame_release(frame_ptr);
+      } else {
+        frame_release(frame_ptr);
       }
-    } else {
-      esp_camera_fb_return(frame.fb);
     }
-
-    // Is anything else busy?
     portYIELD();
   }
 }
 
 void camera_svc_http_task(void *pvParameters) {
   static char url_buf[256];
-  camera_frame_t frame;
+  camera_frame_t *frame_ptr = NULL;
   String url;
-  String path;
   int resp;
 
   // Create url to use for API call
-  memset(url_buf, 0, 256);
-  snprintf(url_buf, 256, "http://%s:%d/api/device/stream?device=%s",
+  memset(url_buf, 0, sizeof(url_buf));
+  snprintf(url_buf, sizeof(url_buf), "http://%s:%d/api/device/stream?device=%s",
            coordinatorIP.toString().c_str(), coordinatorPort,
            deviceName.c_str());
-  // Arduino libaries like to use String instead of char*
   url = url_buf;
 
   for (;;) {
-    // Mostly to reuse old code
-    camera_fb_t *fb;
-    xQueueReceive(CameraFBHTTPQ, &frame, portMAX_DELAY);
-    fb = frame.fb;
+    if (xQueueReceive(CameraFBHTTPQ, &frame_ptr, portMAX_DELAY) == pdPASS) {
+      if (!frame_ptr) continue;
 
-    // Analytics
-    unsigned long t_start = millis();
+      camera_fb_t *fb = frame_ptr->fb;
 
-    http.begin(url);
-    http.addHeader("Content-Type", "image/jpeg");
-    resp = http.PUT(fb->buf, fb->len);
+      http.begin(url);
+      http.addHeader("Content-Type", "image/jpeg");
 
-    unsigned long t_end = millis();
-    unsigned long elapsed = t_end - t_start;
+      http.setTimeout(CONFIG_HTTP_UPLOAD_TIMEOUT_MS);
 
-    Serial.printf("Upload time: %lu ms\n", elapsed);
+      resp = http.PUT(fb->buf, fb->len);
 
-    if (resp != HTTP_CODE_NO_CONTENT) {
-      String err_msg = http.errorToString(resp);
-      Serial.printf("Unexpected response. Got %s (%d)\n", err_msg.c_str(),
-                    resp);
+      // Dont bother printing timeout errors
+      if ((resp != HTTP_CODE_NO_CONTENT) &&
+          (resp != HTTPC_ERROR_READ_TIMEOUT)) {
+        String err = http.errorToString(resp);
+        Serial.printf("HTTP error: %s (%d)\n", err.c_str(), resp);
+      }
+
+      http.end();
+
+      frame_release(frame_ptr);
     }
-
-    http.end();
-
-    esp_camera_fb_return(fb);
   }
 }
 
@@ -276,7 +313,6 @@ static void _ensure_empty_dir(const char *path) {
     return;
   }
 
-  // Directory exists → clear its contents
   File dir = SD_MMC.open(path);
   if (!dir || !dir.isDirectory()) {
     Serial.printf("Failed to open existing directory: %s\n", path);
@@ -287,7 +323,6 @@ static void _ensure_empty_dir(const char *path) {
   while ((entry = dir.openNextFile())) {
     String entryPath = String(path) + "/" + entry.name();
     if (entry.isDirectory()) {
-      // Optional: recursively delete subfolders (not expected here)
       SD_MMC.rmdir(entryPath.c_str());
     } else {
       SD_MMC.remove(entryPath.c_str());
@@ -301,31 +336,24 @@ static void save_fb_to_sd(const camera_fb_t *fb, int time_index,
                           int frame_index) {
   if (!fb) return;
 
-  // Build directory path
   char dir_path[64];
   snprintf(dir_path, sizeof(dir_path), "%s/%d", CAMERA_FB_ROOT, time_index);
 
-  // Create or reset directory
   static int last_time_index = -1;
   if (time_index != last_time_index) {
     _ensure_empty_dir(dir_path);
     last_time_index = time_index;
   }
 
-  // File path for current frame
   char file_path[96];
   snprintf(file_path, sizeof(file_path), "%s/%d.jpg", dir_path, frame_index);
 
-  // Open file
   File file = SD_MMC.open(file_path, FILE_WRITE);
   if (!file) {
     Serial.printf("Failed to open file for writing: %s\n", file_path);
     return;
   }
 
-  // Write frame buffer
   file.write(fb->buf, fb->len);
   file.close();
-
-  Serial.printf("Saved frame: %s (%d bytes)\n", file_path, fb->len);
 }
