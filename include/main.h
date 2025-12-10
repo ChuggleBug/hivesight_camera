@@ -74,4 +74,11 @@ extern PubSubClient mqttClient;
 extern NTPClient timeClient;
 extern HTTPClient http;
 
+/**
+ * @brief Task handle used to notify the camera to begin recording
+ * 
+ */
+extern TaskHandle_t CameraServiceEventTask;
+
+
 #endif  // __MAIN_H

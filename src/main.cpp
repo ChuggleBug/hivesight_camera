@@ -185,7 +185,7 @@ void mqtt_broker_sub_cb(char* topic, uint8_t* payload, unsigned int len) {
     Serial.printf("\b\b ");
     Serial.println();
   }
-  // Matches "sensor/"
+  // Matches "sensor/+"
   else if (strncmp(topic, sensor_topic_prefix, strlen(sensor_topic_prefix)) ==
            0) {
     // topic starts with "sensor/"
@@ -200,6 +200,15 @@ void mqtt_broker_sub_cb(char* topic, uint8_t* payload, unsigned int len) {
 
     Serial.printf("%s is a mapped sensor!", sensorName.c_str());
     Serial.println();
+
+    // Get timestamp of event for the camera to later send over
+    ArduinoJson::JsonDocument json;
+    deserializeJson(json, (char*)payload, len);
+    if (!json["time"].is<uint32_t>()) {
+      Serial.println("Topic received, but message was not properly formatted!");
+      return;
+    }
+    xTaskNotify(CameraServiceEventTask, json["time"].as<uint32_t>(), eSetValueWithOverwrite);
 
   } else {
     Serial.printf("Uknown topic: %s", topic);

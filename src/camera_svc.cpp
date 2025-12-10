@@ -12,7 +12,35 @@
 #include "main.h"
 #include "sdkconfig.h"
 
+// === Enum Classes ===
+
+enum class CAM_STATE {
+  NORMAL,     // normal operations, passively saving + straming
+  RECORDING,  // Notified that it will upload its rolling buffer soon
+  UPLOADING,  // Actively uploading its video
+};
+
+// === Variables ===
+
+CAM_STATE camera_state;
+/**
+ * @brief Time since the event event occured.
+ * @note When uploading, the camera will look
+ * from send from times [start_time - CAMERA_FB_SECOND_RANGE,
+ * start_time + CAMERA_FB_SECOND_RANGE] (with
+ * wraparound)
+ */
+int record_start_time;
+/**
+ * @brief Timestamp of event sent over by the sensor
+ * This will be sent over to the coordinator
+ * when uploading the saved recording
+ *
+ */
+uint32_t timestamp;
+
 // === Local Defines ===
+
 #define CAMERA_FB_SAVE_SZ (CONFIG_CAMERA_FRAME_RATE * 2)
 
 // === Local Functions ===
@@ -21,18 +49,21 @@ void camera_svc_start();
 static void _ensure_empty_dir(const char *path);
 static void save_fb_to_sd(const camera_fb_t *fb, int time_index,
                           int frame_index);
+static void upload_frames(int start_index, int end_index);
 
 // === Task Functions ===
 
 void camera_svc_task(void *pvParameters);
 void camera_svc_save_task(void *pvParameters);
 void camera_svc_http_task(void *pvParameters);
+void camera_svc_event_task(void *pvParameters);
 
 // === FreeRTOS Objects ===
 
 TaskHandle_t CameraServiceTask;
 TaskHandle_t CameraServiceSaveTask;
 TaskHandle_t CameraServiceHTTPTask;
+TaskHandle_t CameraServiceEventTask;
 
 QueueHandle_t CameraFBSaveQ;  // <camera_frame_t*>
 QueueHandle_t CameraFBHTTPQ;  // <camera_frame_t*>
@@ -49,7 +80,7 @@ typedef struct _app_camera_frame {
  * @note The refs counter to ensure free only once
  * was generated using AI. The logic of passing
  * framebuffers to svc -> save -> http was human design
- * 
+ *
  */
 
 static portMUX_TYPE frame_mux = portMUX_INITIALIZER_UNLOCKED;
@@ -190,13 +221,17 @@ void camera_svc_start() {
   s->set_vflip(s, 1);
 #endif
 
-  xTaskCreate(camera_svc_task, "CamSvcTask", 8192, NULL, 5, &CameraServiceTask);
+  camera_state = CAM_STATE::NORMAL;
+  xTaskCreate(camera_svc_task, "CamSvcTask", 8192, NULL, 3, &CameraServiceTask);
 
-  xTaskCreate(camera_svc_save_task, "CamSvcSaveTask", 8192, NULL, 6,
+  xTaskCreate(camera_svc_save_task, "CamSvcSaveTask", 8192, NULL, 5,
               &CameraServiceSaveTask);
 
-  xTaskCreate(camera_svc_http_task, "CamSvcHTTPTask", 16384, NULL, 7,
+  xTaskCreate(camera_svc_http_task, "CamSvcHTTPTask", 16384, NULL, 8,
               &CameraServiceHTTPTask);
+
+  xTaskCreate(camera_svc_event_task, "CamSvcEventTask", 2048, NULL, 8,
+              &CameraServiceEventTask);
 }
 
 void camera_svc_task(void *pvParameters) {
@@ -209,11 +244,43 @@ void camera_svc_task(void *pvParameters) {
 
   TickType_t prevTick = xTaskGetTickCount();
   prev_time_index = timeClient.getEpochTime() % (CAMERA_FB_SECOND_RANGE * 2);
+  record_start_time = -1;
   for (;;) {
     time_index = timeClient.getEpochTime() % (CAMERA_FB_SECOND_RANGE * 2);
     if (prev_time_index != time_index) {
       prev_time_index = time_index;
       frame_index = 0;
+    }
+
+    if (record_start_time != -1) {
+      // Handle wrap around times
+      int dt = (time_index - record_start_time + (CAMERA_FB_SECOND_RANGE * 2)) %
+               (CAMERA_FB_SECOND_RANGE * 2);
+
+      if (dt > CAMERA_FB_SECOND_RANGE) {
+        camera_state = CAM_STATE::UPLOADING;
+        int size = 2 * CAMERA_FB_SECOND_RANGE;
+
+        int record_start_index =
+            ((record_start_time - CAMERA_FB_SECOND_RANGE) % size + size) % size;
+
+        int record_end_index =
+            ((record_start_time + CAMERA_FB_SECOND_RANGE - 1) % size + size) %
+            size;
+
+        Serial.printf("Sending Frames from %d to %d (center: %d)",
+                      record_start_index, record_end_index, record_start_time);
+        Serial.println();
+        
+        // Wait for the save buffer to be emptied before uploading
+        while (uxQueueMessagesWaiting(CameraFBHTTPQ) != 0) {
+          portYIELD();
+        }
+        upload_frames(record_start_index, record_end_index);
+
+        camera_state = CAM_STATE::NORMAL;
+        record_start_time = -1;
+      }
     }
 
     fb = esp_camera_fb_get();
@@ -230,6 +297,11 @@ void camera_svc_task(void *pvParameters) {
           frame_release(frame_ptr);
         }
       }
+    }
+
+    if (camera_state == CAM_STATE::RECORDING && record_start_time == -1) {
+      Serial.println("Begining Capture...");
+      record_start_time = time_index;
     }
 
     vTaskDelayUntil(&prevTick, pdMS_TO_TICKS(1000 / CONFIG_CAMERA_FRAME_RATE));
@@ -307,6 +379,21 @@ void camera_svc_http_task(void *pvParameters) {
   }
 }
 
+void camera_svc_event_task(void *pvParameters) {
+  for (;;) {
+    // Wait until notified
+    timestamp = ulTaskNotifyTake(pdPASS, portMAX_DELAY);
+    if (camera_state != CAM_STATE::NORMAL) {
+      Serial.println("Camera is already busy. Blocking...");
+      continue;
+    }
+    // Start recording
+    Serial.printf("Got timestamp of event: %lu\n", timestamp);
+    Serial.println();
+    camera_state = CAM_STATE::RECORDING;
+  }
+}
+
 static void _ensure_empty_dir(const char *path) {
   if (!SD_MMC.exists(path)) {
     SD_MMC.mkdir(path);
@@ -356,4 +443,9 @@ static void save_fb_to_sd(const camera_fb_t *fb, int time_index,
 
   file.write(fb->buf, fb->len);
   file.close();
+}
+
+
+static void upload_frames(int start_index, int end_index) {
+  
 }
