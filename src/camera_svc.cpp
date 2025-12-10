@@ -38,6 +38,13 @@ int record_start_time;
  *
  */
 uint32_t timestamp;
+/**
+ * @brief Global counter for the number of seconds
+ * which occured since either the start of the camera
+ * or the last time a frame was uploaded
+ *
+ */
+int global_second_counter;
 
 // === Local Defines ===
 
@@ -222,6 +229,7 @@ void camera_svc_start() {
 #endif
 
   camera_state = CAM_STATE::NORMAL;
+  global_second_counter = 0;
   xTaskCreate(camera_svc_task, "CamSvcTask", 8192, NULL, 3, &CameraServiceTask);
 
   xTaskCreate(camera_svc_save_task, "CamSvcSaveTask", 8192, NULL, 5,
@@ -246,10 +254,14 @@ void camera_svc_task(void *pvParameters) {
   prev_time_index = timeClient.getEpochTime() % (CAMERA_FB_SECOND_RANGE * 2);
   record_start_time = -1;
   for (;;) {
+    // Upate folder to write to based on the current time
     time_index = timeClient.getEpochTime() % (CAMERA_FB_SECOND_RANGE * 2);
     if (prev_time_index != time_index) {
       prev_time_index = time_index;
       frame_index = 0;
+      // Icrement the number of seconds which have passed
+      // since the previous upload
+      global_second_counter++;
     }
 
     if (record_start_time != -1) {
@@ -259,6 +271,8 @@ void camera_svc_task(void *pvParameters) {
 
       if (dt > CAMERA_FB_SECOND_RANGE) {
         camera_state = CAM_STATE::UPLOADING;
+
+        // Calculate the number
         int size = 2 * CAMERA_FB_SECOND_RANGE;
 
         int record_start_index =
@@ -268,16 +282,14 @@ void camera_svc_task(void *pvParameters) {
             ((record_start_time + CAMERA_FB_SECOND_RANGE - 1) % size + size) %
             size;
 
-        Serial.printf("Sending Frames from %d to %d (center: %d)",
-                      record_start_index, record_end_index, record_start_time);
-        Serial.println();
-        
         // Wait for the save buffer to be emptied before uploading
         while (uxQueueMessagesWaiting(CameraFBHTTPQ) != 0) {
           portYIELD();
         }
         upload_frames(record_start_index, record_end_index);
 
+        // Reset globals
+        global_second_counter = 0;
         camera_state = CAM_STATE::NORMAL;
         record_start_time = -1;
       }
@@ -380,15 +392,25 @@ void camera_svc_http_task(void *pvParameters) {
 }
 
 void camera_svc_event_task(void *pvParameters) {
+  uint32_t event_timestamp;
   for (;;) {
     // Wait until notified
-    timestamp = ulTaskNotifyTake(pdPASS, portMAX_DELAY);
+    event_timestamp = ulTaskNotifyTake(pdPASS, portMAX_DELAY);
     if (camera_state != CAM_STATE::NORMAL) {
       Serial.println("Camera is already busy. Blocking...");
       continue;
     }
+    // Only start recording if the entire frame buffer in SD
+    // has been reset
+    if (global_second_counter < CAMERA_FB_SECOND_RANGE) {
+      Serial.print("Not enough time has passed since previous upload ");
+      Serial.printf("(Time passed: %ds)", global_second_counter);
+      Serial.println();
+      continue;
+    }
     // Start recording
-    Serial.printf("Got timestamp of event: %lu\n", timestamp);
+    timestamp = event_timestamp;
+    Serial.printf("Got timestamp of event: %lu", timestamp);
     Serial.println();
     camera_state = CAM_STATE::RECORDING;
   }
@@ -445,7 +467,95 @@ static void save_fb_to_sd(const camera_fb_t *fb, int time_index,
   file.close();
 }
 
-
 static void upload_frames(int start_index, int end_index) {
+  int major = start_index;
+  int minor = 0;
+  static char url_buf[256];
+  static char path[256];
+  String url;
+  bool first_second = true;
+  int resp;
+  bool first_frame = true;
+
+  // Create url to use for API call
+  memset(url_buf, 0, sizeof(url_buf));
+  snprintf(url_buf, sizeof(url_buf), "http://%s:%d/api/device/upload?device=%s",
+           coordinatorIP.toString().c_str(), coordinatorPort,
+           deviceName.c_str());
+  url = url_buf;
+
+  Serial.printf("Sending Frames from %d to %d", start_index, end_index);
+  Serial.println();
+  Serial.print("Uploading second ");
+  for (;; major = (major + 1) % (2 * CAMERA_FB_SECOND_RANGE)) {
+    if (!first_second) {
+      Serial.print(" ");
+    }
+    Serial.print(major);
+    first_second = false;
+
+    // Read all frames (minor) inside of directory (major)
+    
+    for (minor = 0;; minor++) {
+      snprintf(path, 256, "%s/%d/%d.jpg", CAMERA_FB_ROOT, major, minor);
+
+      // Since each directory can have a random number of directories
+      // exit once the current frame no longer exists
+      if (!SD_MMC.exists(path)) {
+        break;
+      }
+
+      bool frame_uploaded = false;
+      while (!frame_uploaded) {
+        // Need to reopen the file on every attempt
+        fs::File file = SD_MMC.open(path, "r");
+        int rd_size = file.size();
+        uint8_t* rd_buf = (uint8_t*)pvPortMalloc(rd_size);
+        if (file.read(rd_buf, rd_size) != rd_size); 
+
+        http.begin(url);
+        http.addHeader("Content-Type", "image/jpeg");
+        http.addHeader("Event-Timestamp", String(timestamp));
+        if (first_frame) {
+          http.addHeader("First-Frame", "true");
+        } else {
+          http.addHeader("First-Frame", "false");
+        }
+        http.addHeader("Upload-Complete", "false");
+
+        // Send file as whole
+        resp = http.sendRequest("POST", rd_buf, rd_size);
+        if (resp != HTTP_CODE_NO_CONTENT) {
+          Serial.printf(" (Retry frame)");
+        } else {
+          frame_uploaded = true;
+        }
+
+        file.close();
+        http.end();
+      }
+    }
+
+    // Exit once all content from last frame has
+    // been read
+    if (major == end_index) {
+      Serial.println();
+      break;
+    }
+  }
+  Serial.print("Completed Sending Frames. Sending indicator");
   
+  do {
+    http.begin(url);
+    http.addHeader("Content-Type", "image/jpeg");
+    http.addHeader("Event-Timestamp", String(timestamp));
+    http.addHeader("Upload-Complete", "true");
+    http.addHeader("First-Frame", "false");
+    http.POST((uint8_t*)"", 0);
+    http.end();
+    if (resp != HTTP_CODE_NO_CONTENT) {
+      Serial.print(".");
+    }
+  } while (resp != HTTP_CODE_NO_CONTENT);
+  Serial.println();
 }
