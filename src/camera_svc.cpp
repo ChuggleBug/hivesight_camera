@@ -49,6 +49,8 @@ int global_second_counter;
 // === Local Defines ===
 
 #define CAMERA_FB_SAVE_SZ (CONFIG_CAMERA_FRAME_RATE * 2)
+#define MAX_FRAME_RETRIES (5)
+#define BASE_BACKOFF_MS (200)
 
 // === Local Functions ===
 
@@ -471,9 +473,8 @@ static void upload_frames(int start_index, int end_index) {
   int major = start_index;
   int minor = 0;
   static char url_buf[256];
-  static char path[256];
+  static char path[128];
   String url;
-  bool first_second = true;
   int resp;
   bool first_frame = true;
 
@@ -486,76 +487,96 @@ static void upload_frames(int start_index, int end_index) {
 
   Serial.printf("Sending Frames from %d to %d", start_index, end_index);
   Serial.println();
-  Serial.print("Uploading second ");
+
   for (;; major = (major + 1) % (2 * CAMERA_FB_SECOND_RANGE)) {
-    if (!first_second) {
-      Serial.print(" ");
-    }
-    Serial.print(major);
-    first_second = false;
+    Serial.printf("Uploading second %d ", major);
 
-    // Read all frames (minor) inside of directory (major)
-    
+    // iterate frames inside directory "major"
     for (minor = 0;; minor++) {
-      snprintf(path, 256, "%s/%d/%d.jpg", CAMERA_FB_ROOT, major, minor);
+      snprintf(path, sizeof(path), "%s/%d/%d.jpg", CAMERA_FB_ROOT, major,
+               minor);
 
-      // Since each directory can have a random number of directories
-      // exit once the current frame no longer exists
+      // Since each "major" (second) might vary in the number
+      // of frames it contains, exit the moment a file does
+      // not exist
       if (!SD_MMC.exists(path)) {
         break;
       }
 
+      // Main upload loop for a single frame
+      // Read contents from file before entring
+      // retry loop
       bool frame_uploaded = false;
-      while (!frame_uploaded) {
-        // Need to reopen the file on every attempt
-        fs::File file = SD_MMC.open(path, "r");
-        int rd_size = file.size();
-        uint8_t* rd_buf = (uint8_t*)pvPortMalloc(rd_size);
-        if (file.read(rd_buf, rd_size) != rd_size); 
+      int attempt = 0;
+      fs::File file = SD_MMC.open(path, "r");
+      size_t rd_size = file.size();
+      uint8_t *rd_buf = (uint8_t *)pvPortMalloc(rd_size);
+      file.read(rd_buf, rd_size);
+      while (!frame_uploaded && attempt < MAX_FRAME_RETRIES) {
+        attempt++;
 
+        // Prepare and send HTTP request
         http.begin(url);
         http.addHeader("Content-Type", "image/jpeg");
         http.addHeader("Event-Timestamp", String(timestamp));
-        if (first_frame) {
-          http.addHeader("First-Frame", "true");
-        } else {
-          http.addHeader("First-Frame", "false");
-        }
+        http.addHeader("First-Frame", first_frame ? "true" : "false");
         http.addHeader("Upload-Complete", "false");
+        http.setTimeout(CONFIG_HTTP_UPLOAD_TIMEOUT_MS);
 
-        // Send file as whole
         resp = http.sendRequest("POST", rd_buf, rd_size);
-        if (resp != HTTP_CODE_NO_CONTENT) {
-          Serial.printf(" (Retry frame)");
-        } else {
-          frame_uploaded = true;
-        }
 
-        file.close();
+        // Clean up resources used for this attempt
         http.end();
+
+        if (resp == HTTP_CODE_NO_CONTENT) {
+          frame_uploaded = true;
+          if (first_frame) first_frame = false;
+        } else {
+          Serial.printf("(Retry Frame %d) ", minor);
+          vTaskDelay(pdMS_TO_TICKS(BASE_BACKOFF_MS * attempt));
+        }
+      }
+      file.close();
+      vPortFree(rd_buf);
+
+      if (!frame_uploaded) {
+        Serial.printf("(Skipping frame %d) ", minor);
       }
     }
 
-    // Exit once all content from last frame has
-    // been read
+    Serial.println();
+    // Exit once after last index was read
     if (major == end_index) {
-      Serial.println();
       break;
     }
   }
+
+  // Send final upload complete flag
   Serial.print("Completed Sending Frames. Sending indicator");
-  
+  int attempt = 0;
   do {
     http.begin(url);
     http.addHeader("Content-Type", "image/jpeg");
     http.addHeader("Event-Timestamp", String(timestamp));
     http.addHeader("Upload-Complete", "true");
     http.addHeader("First-Frame", "false");
-    http.POST((uint8_t*)"", 0);
+    http.setTimeout(CONFIG_HTTP_UPLOAD_TIMEOUT_MS);
+    resp = http.POST((uint8_t *)"", 0);
     http.end();
+    attempt++;
+
     if (resp != HTTP_CODE_NO_CONTENT) {
       Serial.print(".");
+      vTaskDelay(pdMS_TO_TICKS(BASE_BACKOFF_MS * attempt));
+    } else {
+      break;
     }
-  } while (resp != HTTP_CODE_NO_CONTENT);
+  } while (resp != HTTP_CODE_NO_CONTENT && attempt <= MAX_FRAME_RETRIES);
+
   Serial.println();
+  if (attempt > MAX_FRAME_RETRIES) {
+    Serial.println("Failed to indicate upload end. Video not uploaded");
+  } else {
+    Serial.println("Complete video buffer sent!");
+  }
 }
